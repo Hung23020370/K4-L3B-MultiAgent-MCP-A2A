@@ -87,8 +87,11 @@ def _extract_ids(values: Any, *keys: str) -> list[str]:
 
 def _normalise_payment_data(data: Any) -> dict[str, Any]:
     if isinstance(data, dict):
-        return data
-    rows = _as_items(data)
+        rows = _as_items(data.get("payment_rows") or data.get("payments") or data.get("items"))
+        if not rows:
+            return dict(data)
+    else:
+        rows = _as_items(data)
     captured_total = sum(float(row.get("payment_value") or 0) for row in rows)
     sequences = [str(row.get("payment_sequential")) for row in rows if row.get("payment_sequential") is not None]
     return {
@@ -99,6 +102,36 @@ def _normalise_payment_data(data: Any) -> dict[str, Any]:
         "duplicate_capture": bool(sequences and len(sequences) != len(set(sequences))),
         "valid_split_payment": bool(len(rows) > 1 and len(sequences) == len(set(sequences))),
     }
+
+
+def _status_tokens(value: Any) -> set[str]:
+    tokens: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if "status" in str(key).lower() or key in {"event", "type", "state"}:
+                tokens.update(_status_tokens(item))
+    elif isinstance(value, list):
+        for item in value:
+            tokens.update(_status_tokens(item))
+    elif isinstance(value, str):
+        tokens.add(value.lower().replace("-", "_").replace(" ", "_"))
+    return tokens
+
+
+def _merge_refund_data(payment: dict[str, Any], refund: Any) -> dict[str, Any]:
+    merged = dict(payment)
+    tokens = _status_tokens(refund)
+    if tokens & {"pending", "refund_pending", "processing", "requested"}:
+        merged["pending_refund"] = True
+    if tokens & {"failed", "refund_failed", "rejected", "error"}:
+        merged["refund_failed"] = True
+    if tokens & {"refunded", "completed", "succeeded", "success"}:
+        merged["refunded_total_brl"] = merged.get("refunded_total_brl") or 0.0
+    if isinstance(refund, dict):
+        for key in ("pending_refund", "refund_failed", "refunded_total_brl", "total_refunded_brl"):
+            if key in refund:
+                merged[key] = refund[key]
+    return merged
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -266,6 +299,7 @@ async def solve_case(
     product_tool = _resolve_tool(discovered_tools, "product_context")
     shipment_tool = _resolve_tool(discovered_tools, "shipment_summary", "shipment")
     payment_tool = _resolve_tool(discovered_tools, "order_payments", "payment_timeline", "payment")
+    payment_timeline_tool = _resolve_tool(discovered_tools, "payment_timeline")
     refund_tool = _resolve_tool(discovered_tools, "refund_timeline", "refund")
     seller_tool = _resolve_tool(discovered_tools, "sellers", "seller")
     policy_tool = _resolve_tool(discovered_tools, "policy")
@@ -282,6 +316,7 @@ async def solve_case(
             "product_tool": bool(product_tool),
             "shipment_tool": bool(shipment_tool),
             "payment_tool": bool(payment_tool),
+            "payment_timeline_tool": bool(payment_timeline_tool),
             "refund_tool": bool(refund_tool),
             "seller_tool": bool(seller_tool),
             "policy_tool": bool(policy_tool),
@@ -295,6 +330,7 @@ async def solve_case(
         ("product", "product_agent", product_tool, lambda: {"order_id": resolved_order_ids[0] if resolved_order_ids else claimed_order_id}),
         ("shipment", "shipment_agent", shipment_tool, lambda: {"order_id": resolved_order_ids[0] if resolved_order_ids else claimed_order_id}),
         ("payment", "payment_agent", payment_tool, lambda: {"order_id": resolved_order_ids[0] if resolved_order_ids else claimed_order_id}),
+        ("payment_timeline", "payment_agent", payment_timeline_tool, lambda: {"order_id": resolved_order_ids[0] if resolved_order_ids else claimed_order_id}),
         ("refund", "refund_agent", refund_tool, lambda: {"order_id": resolved_order_ids[0] if resolved_order_ids else claimed_order_id}),
         ("sellers", "seller_agent", seller_tool, lambda: {"order_id": resolved_order_ids[0] if resolved_order_ids else claimed_order_id}),
         ("policy", "policy_agent", policy_tool, lambda: {"policy_version": case.get("policy_version")}),
@@ -320,17 +356,15 @@ async def solve_case(
                 investigation["order"] = {**(investigation.get("order") or {}), "product_context": data}
             elif name == "payment":
                 investigation["payment"] = _normalise_payment_data(data)
+            elif name == "payment_timeline":
+                investigation["payment"] = _merge_refund_data(
+                    investigation.get("payment") or {}, data
+                )
             elif name == "refund":
                 investigation["refund"] = data
-                if isinstance(data, dict):
-                    investigation["payment"] = {
-                        **(investigation.get("payment") or {}),
-                        **{
-                            key: data[key]
-                            for key in ("pending_refund", "refund_failed", "refunded_total_brl")
-                            if key in data
-                        },
-                    }
+                investigation["payment"] = _merge_refund_data(
+                    investigation.get("payment") or {}, data
+                )
             else:
                 investigation[name] = data
             trace.emit(
@@ -404,12 +438,12 @@ async def solve_case(
     if payment_data:
         if refunded_total_brl and refunded_total_brl > 0:
             payment_verdict = "refunded"
-        elif payment_data.get("pending_refund") is True:
-            payment_verdict = "refund_pending"
         elif payment_data.get("capture_mismatch") or payment_data.get("duplicate_capture"):
             payment_verdict = "duplicate_capture" if payment_data.get("duplicate_capture") else "capture_mismatch"
         elif payment_data.get("refund_failed") is True:
             payment_verdict = "refund_failed"
+        elif payment_data.get("pending_refund") is True:
+            payment_verdict = "refund_pending"
         elif captured_total_brl is not None and refunded_total_brl is not None:
             payment_verdict = "reconciled"
 
@@ -440,6 +474,29 @@ async def solve_case(
                 verdict = "unsupported"
             if payment_verdict in {"refunded", "refund_pending"}:
                 secondary_issues.append("refund_reviewed")
+        elif topic in {"payment_mismatch", "duplicate_charge", "valid_split_payment"}:
+            expected_payment_verdict = {
+                "payment_mismatch": "capture_mismatch",
+                "duplicate_charge": "duplicate_capture",
+            }.get(topic)
+            supported = (
+                payment_data.get("valid_split_payment")
+                if topic == "valid_split_payment"
+                else payment_verdict == expected_payment_verdict
+            )
+            verdict = "supported" if supported else "insufficient_evidence"
+        elif topic in {"refund_pending", "refund_failed"}:
+            verdict = "supported" if payment_verdict == topic else "insufficient_evidence"
+        elif topic in {"canceled_order_paid", "unavailable_order_paid"}:
+            expected_status = topic.removesuffix("_paid")
+            verdict = (
+                "supported"
+                if str(order_data.get("order_status") or "").lower() == expected_status
+                and captured_total_brl is not None
+                else "insufficient_evidence"
+            )
+        elif topic == "unsupported_claim":
+            verdict = "unsupported"
         else:
             verdict = "insufficient_evidence"
         claim_assessments.append(
